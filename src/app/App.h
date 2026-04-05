@@ -131,6 +131,7 @@ private:
     int  m_pid_input     = 0;
     bool m_show_about    = false;
     bool m_show_help     = false;
+    bool m_show_sidebar  = false;  ///< Toggle with Cmd+\ (macOS) / Ctrl+\ (Win/Linux)
 
     // -----------------------------------------------------------------------
     // In-app log
