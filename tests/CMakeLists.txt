@@ -66,7 +66,15 @@ target_link_libraries(AgentDesktopTests PRIVATE
 if(WIN32)
     target_link_libraries(AgentDesktopTests PRIVATE
         user32 gdi32 kernel32)
-elseif(UNIX AND NOT APPLE)
+elseif(APPLE)
+    target_link_libraries(AgentDesktopTests PRIVATE
+        "-framework CoreGraphics"
+        "-framework ScreenCaptureKit"
+        "-framework AppKit"
+        "-framework Foundation"
+        "-framework ApplicationServices"
+        "-framework Accessibility")
+elseif(UNIX)
     find_package(X11 REQUIRED)
     target_link_libraries(AgentDesktopTests PRIVATE
         ${X11_LIBRARIES} ${X11_Xtst_LIB} pthread)

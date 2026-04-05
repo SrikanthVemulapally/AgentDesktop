@@ -40,15 +40,35 @@
 #include <thread>
 #include <vector>
 
-// CGVirtualDisplay SPI (available macOS 12.3+)
-@interface CGVirtualDisplay : NSObject
-- (instancetype)initWithDescriptor:(CGVirtualDisplayDescriptor*)desc;
-@property (readonly) CGDirectDisplayID displayID;
+// CGVirtualDisplay SPI (available macOS 12.4+)
+@interface CGVirtualDisplayMode : NSObject
+- (instancetype)initWithWidth:(NSUInteger)width
+                       height:(NSUInteger)height
+                  refreshRate:(double)refreshRate;
+@property (nonatomic, readonly) NSUInteger width;
+@property (nonatomic, readonly) NSUInteger height;
 @end
+
+@interface CGVirtualDisplaySettings : NSObject
+@property (nonatomic, copy)   NSArray    *modes;
+@property (nonatomic, assign) NSUInteger  hiDPI;
+@end
+
 @interface CGVirtualDisplayDescriptor : NSObject
-@property NSUInteger width, height;
-@property CGFloat    ppi;
-@property NSUInteger refreshRate;
+@property (nonatomic, copy)             NSString         *name;
+@property (nonatomic, assign)           NSUInteger        maxPixelsWide;
+@property (nonatomic, assign)           NSUInteger        maxPixelsHigh;
+@property (nonatomic, assign)           NSUInteger        vendorID;
+@property (nonatomic, assign)           NSUInteger        productID;
+@property (nonatomic, assign)           NSUInteger        serialNumber;
+@property (nullable, nonatomic, strong) dispatch_queue_t  queue;
+@property (nullable, nonatomic, copy)   dispatch_block_t  terminationHandler;
+@end
+
+@interface CGVirtualDisplay : NSObject
+- (nullable instancetype)initWithDescriptor:(CGVirtualDisplayDescriptor *)descriptor;
+- (void)applySettings:(CGVirtualDisplaySettings *)settings;
+@property (nonatomic, readonly) CGDirectDisplayID displayID;
 @end
 
 namespace {
@@ -78,14 +98,21 @@ public:
     int phys_height() const override { return (int)m_h; }
 
 private:
-    CGVirtualDisplay  *m_vd  = nil;
-    CGDirectDisplayID  m_did = 0;
-    NSUInteger m_w = 1920, m_h = 1080;
-    CGPoint    m_origin = {0, 0};
-    pid_t      m_last_pid = 0;
+    CGVirtualDisplay     *m_vd         = nil;
+    CGDirectDisplayID     m_did        = 0;
+    NSUInteger            m_w          = 1920, m_h = 1080;
+    CGPoint               m_origin     = {0, 0};
+    pid_t                 m_last_pid   = 0;
+    NSRunningApplication *m_target_app = nil;
 
-    // Post a mouse event to the virtual display
-    void post_mouse(CGEventType type, CGMouseButton btn, CGPoint pt) const;
+    // Hide cursor → warp to pt → post HID mouse events → warp back → show cursor.
+    // Completes in <0.5 ms so the cursor never visibly moves (CoWorkspace-CPP pattern).
+    static void post_mouse_event(CGPoint pt, CGMouseButton btn,
+                                 CGEventType down_t, CGEventType up_t,
+                                 int click_count = 1);
+
+    // Activate the target app so clicks land on the right element.
+    void ensure_active() const;
 
     // Map key name to CGKeyCode
     static CGKeyCode key_name_to_code(const std::string& name, CGEventFlags& mods_out);
@@ -96,26 +123,64 @@ private:
 // ---------------------------------------------------------------------------
 
 bool MacPlatform::init(std::string& error) {
-    @autoreleasepool {
-        CGVirtualDisplayDescriptor *desc = [[CGVirtualDisplayDescriptor alloc] init];
-        desc.width       = m_w;
-        desc.height      = m_h;
-        desc.ppi         = 96;
-        desc.refreshRate = 30;
+    // CGVirtualDisplay and other AppKit APIs must run on the main thread.
+    // do_connect() calls init() from a background std::thread, so we
+    // dispatch_sync to the main queue.  If we're already on the main thread
+    // (e.g. MCP mode) we call the block directly to avoid deadlock.
+    __block bool         ok  = false;
+    __block std::string  blk_err;
+    __block CGDirectDisplayID blk_did = 0;
 
-        m_vd = [[CGVirtualDisplay alloc] initWithDescriptor:desc];
-        if (!m_vd) {
-            error = "CGVirtualDisplay init failed (requires macOS 12.3+)";
-            return false;
+    // CGVirtualDisplay setup requires the main run loop. dispatch_sync to the
+    // main queue so the background worker thread waits while GLFW drives the loop.
+    dispatch_sync(dispatch_get_main_queue(), ^{
+        @autoreleasepool {
+            [NSApplication sharedApplication];
+
+            CGVirtualDisplayMode *mode = [[CGVirtualDisplayMode alloc]
+                initWithWidth:m_w height:m_h refreshRate:30.0];
+
+            CGVirtualDisplaySettings *settings = [[CGVirtualDisplaySettings alloc] init];
+            settings.hiDPI = 0;
+            settings.modes = @[mode];
+
+            CGVirtualDisplayDescriptor *desc = [[CGVirtualDisplayDescriptor alloc] init];
+            desc.name          = @"AgentDesktop VD";
+            desc.maxPixelsWide = m_w;
+            desc.maxPixelsHigh = m_h;
+            desc.vendorID      = 0x1234;
+            desc.productID     = 0x0001;
+            desc.serialNumber  = 1;
+            desc.queue         = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
+
+            m_vd = [[CGVirtualDisplay alloc] initWithDescriptor:desc];
+            if (!m_vd) {
+                blk_err = "CGVirtualDisplay initWithDescriptor returned nil (requires macOS 12.4+)";
+                return;
+            }
+            blk_did = m_vd.displayID;
+
+            // Give macOS time to register the new virtual display
+            [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:1.0]];
+            [m_vd applySettings:settings];
+
+            // Poll until display reports full dimensions (up to 5 s)
+            CGRect bounds = CGRectZero;
+            for (int i = 0; i < 50; ++i) {
+                [[NSRunLoop mainRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.1]];
+                bounds = CGDisplayBounds(blk_did);
+                if (bounds.size.width >= (CGFloat)m_w &&
+                    bounds.size.height >= (CGFloat)m_h)
+                    break;
+            }
+            m_origin = bounds.origin;
+            ok = true;
         }
-        m_did = m_vd.displayID;
+    });
 
-        // Get origin of the new virtual display
-        CGRect bounds = CGDisplayBounds(m_did);
-        m_origin = bounds.origin;
-        m_w = (NSUInteger)bounds.size.width;
-        m_h = (NSUInteger)bounds.size.height;
-    }
+    if (!ok) { error = blk_err; return false; }
+    m_did = blk_did;
+
     return true;
 }
 
@@ -125,6 +190,7 @@ bool MacPlatform::init(std::string& error) {
 
 agentdesktop::Frame MacPlatform::capture() {
     agentdesktop::Frame frame;
+    if (m_w == 0 || m_h == 0) return frame;  // display not ready yet
     @autoreleasepool {
         dispatch_semaphore_t sem = dispatch_semaphore_create(0);
         __block std::vector<uint8_t> pixels;
@@ -135,7 +201,7 @@ agentdesktop::Frame MacPlatform::capture() {
             if (err) { dispatch_semaphore_signal(sem); return; }
             SCDisplay *tgt = nil;
             for (SCDisplay *d in content.displays)
-                if (d.displayID == self->m_did) { tgt = d; break; }
+                if (d.displayID == m_did) { tgt = d; break; }
             if (!tgt) { dispatch_semaphore_signal(sem); return; }
 
             SCContentFilter *f  = [[SCContentFilter alloc]
@@ -195,7 +261,7 @@ agentdesktop::ScreenshotResult MacPlatform::screenshot(int rx, int ry, int rw, i
             if (err) { dispatch_semaphore_signal(sem); return; }
             SCDisplay *tgt = nil;
             for (SCDisplay *d in content.displays)
-                if (d.displayID == self->m_did) { tgt = d; break; }
+                if (d.displayID == m_did) { tgt = d; break; }
             if (!tgt) { dispatch_semaphore_signal(sem); return; }
 
             SCContentFilter *f  = [[SCContentFilter alloc]
@@ -238,29 +304,78 @@ agentdesktop::ScreenshotResult MacPlatform::screenshot(int rx, int ry, int rw, i
 // ---------------------------------------------------------------------------
 
 agentdesktop::LaunchResult MacPlatform::launch_app(
-        const std::string& path, const std::string& args) {
+        const std::string& path, const std::string& /*args*/) {
     agentdesktop::LaunchResult result;
     @autoreleasepool {
-        NSString *npath = [NSString stringWithUTF8String:path.c_str()];
-        NSString *script = [NSString stringWithFormat:
-            @"tell application \"%@\" to activate", npath];
-        NSAppleScript *as = [[NSAppleScript alloc] initWithSource:script];
-        NSDictionary *err = nil;
-        [as executeAndReturnError:&err];
-        if (err) {
-            result.error = std::string([[err description] UTF8String]);
-            return result;
-        }
-        // Get the PID of the launched app
-        NSArray *apps = [[NSWorkspace sharedWorkspace] runningApplications];
-        for (NSRunningApplication *app in apps) {
-            if ([app.localizedName.lowercaseString containsString:
-                    npath.lastPathComponent.lowercaseString]) {
-                result.pid = app.processIdentifier;
-                m_last_pid = result.pid;
-                break;
+        NSString *appName = [NSString stringWithUTF8String:path.c_str()];
+
+        // Step 1: Warp cursor to VD centre before launch so the new window
+        // appears on the virtual display instead of the user's main screen.
+        CGEventRef q        = CGEventCreate(NULL);
+        CGPoint    saved    = CGEventGetLocation(q);
+        CFRelease(q);
+        CGPoint vd_center   = CGPointMake(m_origin.x + m_w / 2.0,
+                                          m_origin.y + m_h / 2.0);
+        CGWarpMouseCursorPosition(vd_center);
+        CGAssociateMouseAndMouseCursorPosition(false); // freeze visible cursor
+
+        // Step 2: Launch in background (open -ga resolves any app name).
+        std::string cmd = "open -ga '" + path + "'";
+        system(cmd.c_str());
+
+        CGAssociateMouseAndMouseCursorPosition(true);
+        CGWarpMouseCursorPosition(saved);
+
+        // Step 3: Wait up to 10 s for the process to appear.
+        NSRunningApplication *launched = nil;
+        for (int i = 0; i < 100 && !launched; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            for (NSRunningApplication *app in
+                     [[NSWorkspace sharedWorkspace] runningApplications]) {
+                if (!app.terminated &&
+                    [app.localizedName caseInsensitiveCompare:appName]
+                        == NSOrderedSame) {
+                    launched = app;
+                    break;
+                }
             }
         }
+        if (!launched) {
+            result.error = "Process not found after launch: " + path;
+            return result;
+        }
+        result.pid = (int)launched.processIdentifier;
+        m_last_pid = result.pid;
+
+        // Step 4: Wait for finish launching (up to 5 s).
+        for (int i = 0; i < 100 && !launched.isFinishedLaunching; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+        // Step 5: AX API — force-position window onto the virtual display.
+        AXUIElementRef ax_app = AXUIElementCreateApplication(result.pid);
+        CFArrayRef windows = NULL;
+        for (int i = 0; i < 30; ++i) {
+            if (windows) { CFRelease(windows); windows = NULL; }
+            AXUIElementCopyAttributeValue(ax_app, kAXWindowsAttribute,
+                                          (CFTypeRef *)&windows);
+            if (windows && CFArrayGetCount(windows) > 0) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (windows && CFArrayGetCount(windows) > 0) {
+            AXUIElementRef win = (AXUIElementRef)CFArrayGetValueAtIndex(windows, 0);
+            CGPoint pos = { m_origin.x, m_origin.y };
+            CGSize  sz  = { (CGFloat)m_w, (CGFloat)m_h };
+            AXValueRef pv = AXValueCreate((AXValueType)kAXValueCGPointType, &pos);
+            AXValueRef sv = AXValueCreate((AXValueType)kAXValueCGSizeType,  &sz);
+            AXUIElementSetAttributeValue(win, kAXPositionAttribute, pv);
+            AXUIElementSetAttributeValue(win, kAXSizeAttribute,     sv);
+            CFRelease(pv); CFRelease(sv);
+        }
+        if (windows) CFRelease(windows);
+        CFRelease(ax_app);
+
+        m_target_app = launched;
         result.ok = true;
     }
     return result;
@@ -270,69 +385,103 @@ agentdesktop::LaunchResult MacPlatform::launch_app(
 // maximize_window
 // ---------------------------------------------------------------------------
 
-agentdesktop::ActionResult MacPlatform::maximize_window(int pid) {
-    @autoreleasepool {
-        for (NSRunningApplication *app in
-             [[NSWorkspace sharedWorkspace] runningApplications]) {
-            if (app.processIdentifier == pid) {
-                [app activateWithOptions:NSApplicationActivateIgnoringOtherApps];
-                std::this_thread::sleep_for(std::chrono::milliseconds(300));
-                // Send Cmd+Ctrl+F (full screen)
-                CGEventRef d = CGEventCreateKeyboardEvent(NULL, 3 /*F*/, true);
-                CGEventSetFlags(d, kCGEventFlagMaskCommand|kCGEventFlagMaskControl);
-                CGEventPostToPid(pid, d);
-                CFRelease(d);
-                CGEventRef u = CGEventCreateKeyboardEvent(NULL, 3, false);
-                CGEventPostToPid(pid, u);
-                CFRelease(u);
-                return {true};
-            }
-        }
-    }
-    return {false, "Process not found: " + std::to_string(pid)};
+agentdesktop::ActionResult MacPlatform::maximize_window(int /*pid*/) {
+    // Window is already positioned on the virtual display by launch_app via AX API.
+    return {true};
 }
 
 // ---------------------------------------------------------------------------
 // Mouse helpers
 // ---------------------------------------------------------------------------
 
-void MacPlatform::post_mouse(CGEventType type, CGMouseButton btn, CGPoint pt) const {
-    CGEventRef ev = CGEventCreateMouseEvent(NULL, type, pt, btn);
-    if (m_last_pid > 0) CGEventPostToPid(m_last_pid, ev);
-    else                CGEventPost(kCGHIDEventTap, ev);
-    CFRelease(ev);
+
+// Hide cursor → warp to pt → post DOWN+UP → warp back to saved pos → show cursor.
+// Completes in <0.5 ms (sub-frame) so the cursor never visibly moves on the
+// user's physical display. CGEventPost(kCGHIDEventTap) reaches every app layer.
+void MacPlatform::post_mouse_event(CGPoint pt, CGMouseButton btn,
+                                    CGEventType down_t, CGEventType up_t,
+                                    int click_count) {
+    CGEventRef query = CGEventCreate(NULL);
+    CGPoint    saved = CGEventGetLocation(query);
+    CFRelease(query);
+
+    CGDisplayHideCursor(kCGDirectMainDisplay);
+    CGWarpMouseCursorPosition(pt);
+
+    CGEventRef d = CGEventCreateMouseEvent(NULL, down_t, pt, btn);
+    CGEventRef u = CGEventCreateMouseEvent(NULL, up_t,   pt, btn);
+    CGEventSetIntegerValueField(d, kCGMouseEventClickState, click_count);
+    CGEventSetIntegerValueField(u, kCGMouseEventClickState, click_count);
+    CGEventPost(kCGHIDEventTap, d);
+    CGEventPost(kCGHIDEventTap, u);
+    CFRelease(d);
+    CFRelease(u);
+
+    CGWarpMouseCursorPosition(saved);
+    CGDisplayShowCursor(kCGDirectMainDisplay);
+}
+
+// Activate the target app before clicking so the click lands on the right
+// element instead of being consumed as a window-activation event.
+void MacPlatform::ensure_active() const {
+    if (!m_target_app || m_target_app.terminated || m_target_app.isActive) return;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    [m_target_app activateWithOptions:NSApplicationActivateIgnoringOtherApps];
+#pragma clang diagnostic pop
+    for (int i = 0; i < 8 && !m_target_app.isActive; ++i)
+        usleep(10000); // 10 ms per poll, up to 80 ms total
 }
 
 agentdesktop::ActionResult MacPlatform::click(int x, int y) {
+    if (!AXIsProcessTrusted())
+        return {false, "Accessibility permission required — enable in System Settings"};
+    ensure_active();
     const CGPoint pt{m_origin.x + x, m_origin.y + y};
-    post_mouse(kCGEventLeftMouseDown, kCGMouseButtonLeft, pt);
-    std::this_thread::sleep_for(std::chrono::milliseconds(30));
-    post_mouse(kCGEventLeftMouseUp,   kCGMouseButtonLeft, pt);
+    post_mouse_event(pt, kCGMouseButtonLeft,
+                     kCGEventLeftMouseDown, kCGEventLeftMouseUp);
     return {true};
 }
 
 agentdesktop::ActionResult MacPlatform::double_click(int x, int y) {
-    click(x, y);
-    std::this_thread::sleep_for(std::chrono::milliseconds(60));
-    click(x, y);
+    if (!AXIsProcessTrusted())
+        return {false, "Accessibility permission required"};
+    ensure_active();
+    const CGPoint pt{m_origin.x + x, m_origin.y + y};
+    post_mouse_event(pt, kCGMouseButtonLeft,
+                     kCGEventLeftMouseDown, kCGEventLeftMouseUp, 1);
+    post_mouse_event(pt, kCGMouseButtonLeft,
+                     kCGEventLeftMouseDown, kCGEventLeftMouseUp, 2);
     return {true};
 }
 
 agentdesktop::ActionResult MacPlatform::right_click(int x, int y) {
+    if (!AXIsProcessTrusted())
+        return {false, "Accessibility permission required"};
+    ensure_active();
     const CGPoint pt{m_origin.x + x, m_origin.y + y};
-    post_mouse(kCGEventRightMouseDown, kCGMouseButtonRight, pt);
-    std::this_thread::sleep_for(std::chrono::milliseconds(30));
-    post_mouse(kCGEventRightMouseUp,   kCGMouseButtonRight, pt);
+    post_mouse_event(pt, kCGMouseButtonRight,
+                     kCGEventRightMouseDown, kCGEventRightMouseUp);
     return {true};
 }
 
 agentdesktop::ActionResult MacPlatform::scroll(int x, int y, int delta) {
+    const CGPoint pt{m_origin.x + x, m_origin.y + y};
+    CGEventRef query = CGEventCreate(NULL);
+    CGPoint    saved = CGEventGetLocation(query);
+    CFRelease(query);
+
+    CGDisplayHideCursor(kCGDirectMainDisplay);
+    CGWarpMouseCursorPosition(pt);
+
     CGEventRef ev = CGEventCreateScrollWheelEvent(NULL,
         kCGScrollEventUnitLine, 1, delta);
-    if (m_last_pid > 0) CGEventPostToPid(m_last_pid, ev);
-    else                CGEventPost(kCGHIDEventTap, ev);
+    CGEventSetLocation(ev, pt);
+    CGEventPost(kCGHIDEventTap, ev);
     CFRelease(ev);
-    (void)x; (void)y;
+
+    CGWarpMouseCursorPosition(saved);
+    CGDisplayShowCursor(kCGDirectMainDisplay);
     return {true};
 }
 

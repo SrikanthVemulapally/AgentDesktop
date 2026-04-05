@@ -133,6 +133,15 @@ private:
     // Return the frontmost visible window on the virtual desktop
     HWND topmost_window() const;
 
+    // Find the actual focused child control to send keyboard input to
+    HWND find_typing_target(HWND main_wnd) const;
+
+    // Bring a window into focus on the virtual desktop
+    void activate_window(HWND hWnd) const;
+
+    // Detect and fix solid-black Chrome windows caused by GPU compositor on hidden desktop
+    void maybe_relaunch_chrome_if_black();
+
     // LPARAM encoding for WM_*BUTTON* messages
     static LPARAM lp_xy(int x, int y) {
         return (LPARAM)((((WORD)y) << 16) | ((WORD)x));
@@ -385,43 +394,60 @@ agentdesktop::ScreenshotResult WindowsPlatform::screenshot(
 // ---------------------------------------------------------------------------
 
 std::wstring WindowsPlatform::resolve_app(const std::string& app) {
-    // If it already looks like a path, use as-is
-    if (app.find('\\') != std::string::npos ||
-        app.find('/')  != std::string::npos ||
-        app.size() > 4 &&
-            app.substr(app.size()-4) == ".exe")
-        return to_wide(app);
+    const std::wstring wapp = to_wide(app);
+
+    // Already an absolute path — use as-is
+    if (wapp.find(L'\\') != std::wstring::npos || wapp.find(L'/') != std::wstring::npos)
+        return wapp;
+
+    // Lower-case for map lookup
+    std::wstring lower = wapp;
+    for (auto& c : lower) c = towlower(c);
+
+    // Browsers first with absolute install paths (not in PATH or System32)
+    static const std::pair<const wchar_t*, const wchar_t*> kAbsMap[] = {
+        {L"chrome",        L"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"},
+        {L"google chrome", L"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"},
+        {L"edge",          L"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"},
+        {L"microsoft edge",L"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"},
+    };
+    for (auto& [key, val] : kAbsMap) {
+        if (lower == key) {
+            if (GetFileAttributesW(val) != INVALID_FILE_ATTRIBUTES)
+                return val;
+            break; // not at expected location — fall through to PATH search
+        }
+    }
+
+    const std::wstring wexe = wapp.find(L'.') == std::wstring::npos
+                              ? wapp + L".exe" : wapp;
 
     // Search PATH
     wchar_t found[MAX_PATH]{};
-    const std::wstring wapp = to_wide(app);
-    const std::wstring wexe = wapp.find(L'.') == std::wstring::npos
-                              ? wapp + L".exe" : wapp;
-    if (SearchPathW(nullptr, wexe.c_str(), nullptr,
-                    MAX_PATH, found, nullptr))
+    if (SearchPathW(nullptr, wexe.c_str(), nullptr, MAX_PATH, found, nullptr))
         return found;
 
-    // Common known apps
+    // Common system apps
     wchar_t sys[MAX_PATH]{};
     GetSystemDirectoryW(sys, MAX_PATH);
     const std::wstring sysd(sys);
 
-    static const std::pair<const wchar_t*, const wchar_t*> kMap[] = {
-        {L"notepad",      L"notepad.exe"},
-        {L"calc",         L"calc.exe"},
-        {L"paint",        L"mspaint.exe"},
-        {L"cmd",          L"cmd.exe"},
-        {L"powershell",   L"WindowsPowerShell\\v1.0\\powershell.exe"},
-        {L"explorer",     L"explorer.exe"},
-        {L"wordpad",      L"wordpad.exe"},
-        {L"taskmgr",      L"taskmgr.exe"},
+    static const std::pair<const wchar_t*, const wchar_t*> kSysMap[] = {
+        {L"notepad",    L"notepad.exe"},
+        {L"calc",       L"calc.exe"},
+        {L"paint",      L"mspaint.exe"},
+        {L"cmd",        L"cmd.exe"},
+        {L"powershell", L"WindowsPowerShell\\v1.0\\powershell.exe"},
+        {L"explorer",   L"explorer.exe"},
+        {L"wordpad",    L"wordpad.exe"},
+        {L"taskmgr",    L"taskmgr.exe"},
     };
-    for (auto& [key, val] : kMap) {
-        if (_wcsicmp(wapp.c_str(), key) == 0) {
+    for (auto& [key, val] : kSysMap) {
+        if (lower == key) {
             const std::wstring full = sysd + L"\\" + val;
             if (GetFileAttributesW(full.c_str()) != INVALID_FILE_ATTRIBUTES)
                 return full;
-            return val; // let CreateProcess search
+            return val;
         }
     }
     return wexe;
@@ -432,17 +458,28 @@ agentdesktop::LaunchResult WindowsPlatform::launch_app(
     agentdesktop::LaunchResult result;
 
     const std::wstring wpath = resolve_app(path);
-    const std::wstring wargs = to_wide(args);
+    std::wstring wargs = to_wide(args);
+
+    // Chrome / Edge: inject --disable-gpu and a per-desktop user-data-dir so
+    // the browser renders correctly on the virtual display (CoWorkspace-V2 pattern).
+    const bool is_chrome = wpath.find(L"chrome.exe") != std::wstring::npos;
+    const bool is_edge   = wpath.find(L"msedge.exe") != std::wstring::npos;
+    if (is_chrome || is_edge) {
+        if (wargs.find(L"--disable-gpu") == std::wstring::npos) {
+            wchar_t tmp[MAX_PATH]{};
+            GetTempPathW(MAX_PATH, tmp);
+            const std::wstring udd = std::wstring(tmp) + L"ad-" + m_desk_name;
+            wargs += L" --disable-gpu --no-first-run --user-data-dir=\"" + udd + L"\"";
+        }
+    }
 
     std::wstring cmdline = L"\"" + wpath + L"\"";
     if (!wargs.empty()) cmdline += L" " + wargs;
 
     STARTUPINFOW si{};
-    si.cb          = sizeof(si);
+    si.cb        = sizeof(si);
     // Must use station-qualified name so the process attaches to the right desktop
-    si.lpDesktop   = m_desk_full.data();
-    si.dwFlags     = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_SHOWNORMAL;
+    si.lpDesktop = m_desk_full.data();
 
     PROCESS_INFORMATION pi{};
     if (!CreateProcessW(nullptr,
@@ -572,7 +609,11 @@ HWND WindowsPlatform::topmost_window() const {
     HWND top = nullptr;
     EnumDesktopWindows(m_desktop,
         [](HWND h, LPARAM lp) -> BOOL {
-            if (IsWindowVisible(h) && !GetParent(h)) {
+            if (!IsWindowVisible(h)) return TRUE;
+            wchar_t title[256]{};
+            GetWindowTextW(h, title, 256);
+            // Skip the desktop shell window and untitled windows
+            if (wcscmp(title, L"Program Manager") != 0 && title[0] != L'\0') {
                 *reinterpret_cast<HWND*>(lp) = h;
                 return FALSE;
             }
@@ -583,30 +624,166 @@ HWND WindowsPlatform::topmost_window() const {
 }
 
 // ---------------------------------------------------------------------------
+// find_typing_target — resolve the focused child input control
+// Uses AttachThreadInput to query focus across thread boundaries, then falls
+// back to searching for an Edit/RichEdit child (CoWorkspace-V2 pattern).
+// ---------------------------------------------------------------------------
+
+HWND WindowsPlatform::find_typing_target(HWND main_wnd) const {
+    if (!main_wnd) return nullptr;
+
+    DWORD tid_current = GetCurrentThreadId();
+    DWORD tid_target  = GetWindowThreadProcessId(main_wnd, nullptr);
+    HDESK hOrig       = GetThreadDesktop(tid_current);
+    bool  switched    = (hOrig != m_desktop) && SetThreadDesktop(m_desktop);
+
+    HWND focused = nullptr;
+    if (tid_target && tid_target != tid_current) {
+        if (AttachThreadInput(tid_current, tid_target, TRUE)) {
+            focused = GetFocus();
+            AttachThreadInput(tid_current, tid_target, FALSE);
+        }
+    }
+    if (switched) SetThreadDesktop(hOrig);
+    if (focused) return focused;
+
+    // Fallback: find the first visible Edit / RichEdit child
+    HWND editChild = nullptr;
+    EnumChildWindows(main_wnd, [](HWND h, LPARAM lp) -> BOOL {
+        wchar_t cls[64]{};
+        GetClassNameW(h, cls, 64);
+        if ((wcscmp(cls, L"Edit") == 0 || wcsncmp(cls, L"RichEdit", 8) == 0)
+                && IsWindowVisible(h)) {
+            *reinterpret_cast<HWND*>(lp) = h;
+            return FALSE;
+        }
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&editChild));
+
+    return editChild ? editChild : main_wnd;
+}
+
+// ---------------------------------------------------------------------------
+// activate_window — bring target window to focus on the virtual desktop
+// ---------------------------------------------------------------------------
+
+void WindowsPlatform::activate_window(HWND hWnd) const {
+    DWORD tid_current = GetCurrentThreadId();
+    HDESK hOrig       = GetThreadDesktop(tid_current);
+    bool  switched    = (hOrig != m_desktop) && SetThreadDesktop(m_desktop);
+
+    BringWindowToTop(hWnd);
+    DWORD tid_target = GetWindowThreadProcessId(hWnd, nullptr);
+    if (tid_target && tid_target != tid_current) {
+        if (AttachThreadInput(tid_current, tid_target, TRUE)) {
+            SetForegroundWindow(hWnd);
+            SetFocus(hWnd);
+            AttachThreadInput(tid_current, tid_target, FALSE);
+        }
+    }
+    if (switched) SetThreadDesktop(hOrig);
+}
+
+// ---------------------------------------------------------------------------
+// maybe_relaunch_chrome_if_black
+// Called as a detached thread after double_click.  Waits for Chrome to start,
+// then checks if its window is solid black (GPU compositor can't render on a
+// hidden virtual desktop).  If black, kills the process and relaunches with
+// --disable-gpu so Skia falls back to software rendering GDI can capture.
+// ---------------------------------------------------------------------------
+
+void WindowsPlatform::maybe_relaunch_chrome_if_black() {
+    Sleep(3500); // give Chrome time to fully start
+
+    struct Ctx { HDESK desktop; std::vector<HWND> wnds; };
+    Ctx ctx{ m_desktop, {} };
+    EnumDesktopWindows(m_desktop, [](HWND h, LPARAM lp) -> BOOL {
+        auto* c = reinterpret_cast<Ctx*>(lp);
+        if (!IsWindowVisible(h)) return TRUE;
+        wchar_t cls[64]{};
+        GetClassNameW(h, cls, 64);
+        if (wcscmp(cls, L"Chrome_WidgetWin_1") != 0) return TRUE;
+        RECT r;
+        if (GetWindowRect(h, &r) && (r.right - r.left) > 300 && (r.bottom - r.top) > 300)
+            c->wnds.push_back(h);
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&ctx));
+
+    if (ctx.wnds.empty()) return;
+
+    HDC  hScreenDC  = GetDC(nullptr);
+    bool killed_any = false;
+
+    for (HWND hWnd : ctx.wnds) {
+        RECT r;
+        if (!GetWindowRect(hWnd, &r)) continue;
+        int ww = r.right - r.left, wh = r.bottom - r.top;
+
+        HDC     hDC  = CreateCompatibleDC(hScreenDC);
+        HBITMAP hBmp = CreateCompatibleBitmap(hScreenDC, ww, wh);
+        HGDIOBJ hOld = SelectObject(hDC, hBmp);
+        PrintWindow(hWnd, hDC, PW_RENDERFULLCONTENT);
+
+        // Sample centre-third grid
+        int x0 = ww / 3, x1 = 2 * ww / 3;
+        int y0 = wh / 3, y1 = 2 * wh / 3;
+        int black_count = 0, sample_count = 0;
+        for (int sx = x0; sx <= x1; sx += (x1 - x0) / 3 + 1)
+            for (int sy = y0; sy <= y1; sy += (y1 - y0) / 3 + 1) {
+                if (GetPixel(hDC, sx, sy) == RGB(0, 0, 0)) ++black_count;
+                ++sample_count;
+            }
+
+        SelectObject(hDC, hOld);
+        DeleteObject(hBmp);
+        DeleteDC(hDC);
+
+        if (sample_count == 0 || black_count != sample_count) continue;
+
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hWnd, &pid);
+        if (pid) {
+            HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+            if (hProc) { TerminateProcess(hProc, 0); CloseHandle(hProc); }
+        }
+        killed_any = true;
+    }
+
+    ReleaseDC(nullptr, hScreenDC);
+    if (killed_any) {
+        Sleep(800);
+        launch_app("chrome", "");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // click / double_click / right_click
 // ---------------------------------------------------------------------------
 
 agentdesktop::ActionResult WindowsPlatform::click(int x, int y) {
     auto [tgt, cx, cy] = hit_test(x, y);
     if (!tgt) return {false, "No window at coordinate"};
+    activate_window(tgt);
     const LPARAM lp = lp_xy(cx, cy);
+    PostMessage(tgt, WM_MOUSEMOVE,   0,          lp);
     PostMessage(tgt, WM_LBUTTONDOWN, MK_LBUTTON, lp);
-    Sleep(30);
-    PostMessage(tgt, WM_LBUTTONUP,   0,           lp);
+    PostMessage(tgt, WM_LBUTTONUP,   0,          lp);
     return {true};
 }
 
 agentdesktop::ActionResult WindowsPlatform::double_click(int x, int y) {
     auto [tgt, cx, cy] = hit_test(x, y);
     if (!tgt) return {false, "No window at coordinate"};
+    activate_window(tgt);
     const LPARAM lp = lp_xy(cx, cy);
-    PostMessage(tgt, WM_LBUTTONDOWN,  MK_LBUTTON, lp);
-    Sleep(30);
-    PostMessage(tgt, WM_LBUTTONUP,    0,           lp);
-    Sleep(60);
-    PostMessage(tgt, WM_LBUTTONDBLCLK,MK_LBUTTON, lp);
-    Sleep(30);
-    PostMessage(tgt, WM_LBUTTONUP,    0,           lp);
+    PostMessage(tgt, WM_MOUSEMOVE,     0,          lp);
+    PostMessage(tgt, WM_LBUTTONDOWN,   MK_LBUTTON, lp);
+    PostMessage(tgt, WM_LBUTTONUP,     0,          lp);
+    PostMessage(tgt, WM_LBUTTONDBLCLK, MK_LBUTTON, lp);
+    PostMessage(tgt, WM_LBUTTONUP,     0,          lp);
+    // Chrome launched via double-click may render black on a hidden desktop;
+    // detect and fix it in the background (CoWorkspace reference pattern).
+    std::thread([this]() { maybe_relaunch_chrome_if_black(); }).detach();
     return {true};
 }
 
@@ -638,14 +815,14 @@ agentdesktop::ActionResult WindowsPlatform::scroll(int x, int y, int delta) {
 // ---------------------------------------------------------------------------
 
 agentdesktop::ActionResult WindowsPlatform::type_text(const std::string& text) {
-    const HWND tgt = topmost_window();
-    if (!tgt) return {false, "No foreground window"};
+    const HWND hMain = topmost_window();
+    if (!hMain) return {false, "No active window on virtual desktop"};
 
+    const HWND hTarget = find_typing_target(hMain);
+    activate_window(hTarget);
     const std::wstring wide = to_wide(text);
-    for (wchar_t ch : wide) {
-        PostMessage(tgt, WM_CHAR, static_cast<WPARAM>(ch), 0);
-        Sleep(4);
-    }
+    for (wchar_t ch : wide)
+        PostMessage(hTarget, WM_CHAR, static_cast<WPARAM>(ch), 1);
     return {true};
 }
 
@@ -691,26 +868,49 @@ agentdesktop::ActionResult WindowsPlatform::key_press(const std::string& key) {
 
     if (!vk) return {false, "Unrecognised key: " + key};
 
-    // Build INPUT array
-    std::vector<INPUT> inputs;
-    auto push_key = [&](UINT code, bool down) {
-        INPUT in{};
-        in.type       = INPUT_KEYBOARD;
-        in.ki.wVk     = static_cast<WORD>(code);
-        in.ki.dwFlags = down ? 0 : KEYEVENTF_KEYUP;
-        inputs.push_back(in);
-    };
+    HWND hMain   = topmost_window();
+    HWND hTarget = find_typing_target(hMain);
 
-    if (ctrl)  push_key(VK_CONTROL, true);
-    if (alt)   push_key(VK_MENU,    true);
-    if (shift) push_key(VK_SHIFT,   true);
-    push_key(vk, true);
-    push_key(vk, false);
-    if (shift) push_key(VK_SHIFT,   false);
-    if (alt)   push_key(VK_MENU,    false);
-    if (ctrl)  push_key(VK_CONTROL, false);
+    if (ctrl || alt || shift) {
+        // PostMessage does not update GetKeyState, so modifier combos (e.g. Ctrl+C)
+        // fail in apps that check GetKeyState(VK_CONTROL) in their WM_KEYDOWN handler.
+        // Use SendInput instead — it feeds the hardware input queue and sets keyboard
+        // state correctly. Switch to the virtual desktop thread first and bring the
+        // target window into focus (CoWorkspace-V2 pattern).
+        DWORD tid_current = GetCurrentThreadId();
+        HDESK hOrig       = GetThreadDesktop(tid_current);
+        bool  switched    = (hOrig != m_desktop) && SetThreadDesktop(m_desktop);
 
-    SendInput(static_cast<UINT>(inputs.size()), inputs.data(), sizeof(INPUT));
+        if (hTarget) activate_window(hTarget);
+
+        std::vector<INPUT> inputs;
+        auto push_key = [&](WORD code, bool down) {
+            INPUT in{};
+            in.type       = INPUT_KEYBOARD;
+            in.ki.wVk     = code;
+            in.ki.wScan   = static_cast<WORD>(MapVirtualKey(code, MAPVK_VK_TO_VSC));
+            in.ki.dwFlags = down ? 0 : KEYEVENTF_KEYUP;
+            inputs.push_back(in);
+        };
+
+        if (ctrl)  push_key(VK_CONTROL, true);
+        if (alt)   push_key(VK_MENU,    true);
+        if (shift) push_key(VK_SHIFT,   true);
+        push_key(static_cast<WORD>(vk), true);
+        push_key(static_cast<WORD>(vk), false);
+        if (shift) push_key(VK_SHIFT,   false);
+        if (alt)   push_key(VK_MENU,    false);
+        if (ctrl)  push_key(VK_CONTROL, false);
+
+        SendInput(static_cast<UINT>(inputs.size()), inputs.data(), sizeof(INPUT));
+        if (switched) SetThreadDesktop(hOrig);
+    } else {
+        if (!hTarget) return {false, "No window on virtual desktop"};
+        PostMessage(hTarget, WM_KEYDOWN, vk, 0);
+        Sleep(10);
+        PostMessage(hTarget, WM_KEYUP,   vk, 0);
+    }
+
     return {true};
 }
 

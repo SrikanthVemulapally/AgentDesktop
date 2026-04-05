@@ -97,7 +97,8 @@ AgentDesktopApp::AgentDesktopApp(GLFWwindow* window)
     glBindTexture(GL_TEXTURE_2D, 0);
 
     m_fps_t0 = now();
-    log("AgentDesktop ready. Click Connect to start the virtual desktop.");
+    log("AgentDesktop starting — initializing virtual desktop...");
+    do_connect();
 }
 
 AgentDesktopApp::~AgentDesktopApp() {
@@ -196,12 +197,15 @@ void AgentDesktopApp::upload_frame() {
     const int h = m_latest_frame.height;
     if (w <= 0 || h <= 0 || m_latest_frame.pixels.empty()) return;
 
-    // GDI GetDIBits returns BGRA — swap to RGBA in-place because
-    // GL_BGRA is an extension that may not be available through
-    // GLFW's built-in OpenGL 3.3 Core loader.
+    // Both GDI (GetDIBits/BI_RGB) and CGBitmapContext (kCGImageAlphaNoneSkipFirst)
+    // return BGRA with alpha=0. Swap B↔R and force alpha=255 so the texture
+    // is opaque RGBA — matching CoWorkspace-V2's capture() approach.
     uint8_t* p = m_latest_frame.pixels.data();
     const size_t n = m_latest_frame.pixels.size();
-    for (size_t i = 0; i < n; i += 4) std::swap(p[i], p[i + 2]);
+    for (size_t i = 0; i < n; i += 4) {
+        std::swap(p[i], p[i + 2]); // B↔R
+        p[i + 3] = 255;            // force alpha opaque
+    }
 
     glBindTexture(GL_TEXTURE_2D, m_tex);
     if (w != m_tex_w || h != m_tex_h) {
@@ -223,21 +227,23 @@ void AgentDesktopApp::send_click(float rx, float ry, int type) {
     if (!m_platform) return;
     const int x = static_cast<int>(rx * m_platform->phys_width());
     const int y = static_cast<int>(ry * m_platform->phys_height());
-    async([this, x, y, type]() {
+    // thread which stalls the GLFW run loop and can reset cursor associations
+    // mid-warp, causing the real cursor to briefly jump.
+    std::thread([this, x, y, type]() {
         ActionResult r = (type == 1) ? m_platform->double_click(x, y)
                        : (type == 2) ? m_platform->right_click(x, y)
                        :               m_platform->click(x, y);
         if (!r.ok) log("Click error: " + r.error, LogEntry::Level::Warn);
-    });
+    }).detach();
 }
 
 void AgentDesktopApp::send_scroll(float rx, float ry, int delta) {
     if (!m_platform) return;
     const int x = static_cast<int>(rx * m_platform->phys_width());
     const int y = static_cast<int>(ry * m_platform->phys_height());
-    async([this, x, y, delta]() {
+    std::thread([this, x, y, delta]() {
         m_platform->scroll(x, y, delta);
-    });
+    }).detach();
 }
 
 // ---------------------------------------------------------------------------
@@ -280,15 +286,18 @@ void AgentDesktopApp::render() {
     constexpr float SIDEBAR_W = 270.f;
 
     const float preview_h = total_h - TITLE_H - STATUS_H - LOG_H;
-    const float preview_w = total_w - SIDEBAR_W;
+    const float sidebar_w = m_show_sidebar ? SIDEBAR_W : 0.f;
+    const float preview_w = total_w - sidebar_w;
 
     draw_titlebar();
 
     // Main row
     ImGui::SetCursorPos({0, TITLE_H});
     draw_preview(preview_w, preview_h);
-    ImGui::SetCursorPos({preview_w, TITLE_H});
-    draw_sidebar(SIDEBAR_W, preview_h);
+    if (m_show_sidebar) {
+        ImGui::SetCursorPos({preview_w, TITLE_H});
+        draw_sidebar(SIDEBAR_W, preview_h);
+    }
 
     // Log + status
     ImGui::SetCursorPos({0, TITLE_H + preview_h});
@@ -365,22 +374,18 @@ void AgentDesktopApp::draw_titlebar() {
 
     ImGui::SameLine(0, 4);
     if (ImGui::Button("About", {54, btn_h})) m_show_about = true;
-    ImGui::SameLine(0, 12);
+    ImGui::SameLine(0, 4);
 
-    // Connect / Disconnect
-    if (!m_active) {
-        ImGui::PushStyleColor(ImGuiCol_Button,        hx(ACE_DIM));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, hx(ACE));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  hx(ACE_ACT));
-        if (ImGui::Button("Connect", {90, btn_h})) do_connect();
-        ImGui::PopStyleColor(3);
-    } else {
-        ImGui::PushStyleColor(ImGuiCol_Button,        hx(0x7A1A1AFF));
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, hx(0xAA2222FF));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive,  hx(0x661111FF));
-        if (ImGui::Button("Disconnect", {90, btn_h})) do_disconnect();
-        ImGui::PopStyleColor(3);
-    }
+    // Sidebar toggle button
+    ImGui::PushStyleColor(ImGuiCol_Button,
+        m_show_sidebar ? hx(0x2A3060FF) : hx(BG3));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, hx(0x2E3356FF));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  hx(BG3));
+    if (ImGui::Button("Panel", {54, btn_h})) m_show_sidebar = !m_show_sidebar;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Toggle side panel  (Cmd+\\)");
+    ImGui::PopStyleColor(3);
+    ImGui::SameLine(0, 12);
 
     ImGui::PopStyleVar(); // FrameRounding
 
@@ -405,8 +410,10 @@ void AgentDesktopApp::draw_preview(float w, float h) {
     m_preview_hover = false;
 
     if (!m_active || m_tex_w == 0) {
-        // Placeholder when not connected
-        const char* msg = m_active ? "Waiting for first frame…" : "Not connected";
+        // Placeholder while connecting / waiting for first frame
+        const char* msg = m_active       ? "Waiting for first frame…"
+                        : m_busy.load() ? "Connecting…"
+                        :                 "Not connected";
         const ImVec2 ts = ImGui::CalcTextSize(msg);
         dl->AddText({wp.x + (w - ts.x) * 0.5f, wp.y + (h - ts.y) * 0.5f},
                     col(BLUE_DIM), msg);
@@ -832,6 +839,17 @@ void AgentDesktopApp::draw_help() {
 
 void AgentDesktopApp::on_key(int glfw_key, int action, int mods) {
     ImGui_ImplGlfw_KeyCallback(m_win, glfw_key, 0, action, mods);
+
+    // Cmd+\ (macOS) or Ctrl+\ (Win/Linux) — toggle sidebar, works always
+    // GLFW_KEY_BACKSLASH=92, GLFW_MOD_SUPER=8, GLFW_MOD_CONTROL=2
+    if (action != 0 /* not RELEASE */ && glfw_key == 92) {
+        const bool cmd_or_ctrl = (mods & 8) || (mods & 2);
+        if (cmd_or_ctrl) {
+            m_show_sidebar = !m_show_sidebar;
+            return;
+        }
+    }
+
     if (!m_active || !m_platform) return;
     if (action == 0 /* GLFW_RELEASE */ ) return;
     if (ImGui::GetIO().WantCaptureKeyboard) return;
