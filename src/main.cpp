@@ -71,6 +71,7 @@ int main(int argc, char* argv[]) {
     glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
 #endif
     glfwWindowHint(GLFW_SAMPLES, 0);
+    glfwWindowHint(GLFW_DECORATED, GLFW_FALSE);
 
     GLFWwindow* window = glfwCreateWindow(
         1440, 900, "AgentDesktop", nullptr, nullptr);
@@ -78,6 +79,14 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "Failed to create GLFW window\n");
         glfwTerminate();
         return 1;
+    }
+
+    // Centre on primary monitor
+    if (GLFWmonitor* mon = glfwGetPrimaryMonitor()) {
+        const GLFWvidmode* vm = glfwGetVideoMode(mon);
+        if (vm) glfwSetWindowPos(window,
+                                 (vm->width  - 1440) / 2,
+                                 (vm->height -  900) / 2);
     }
 
     glfwMakeContextCurrent(window);
@@ -88,7 +97,6 @@ int main(int argc, char* argv[]) {
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = "agentdesktop.ini"; // persist window layout
-    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 
     ImGui_ImplGlfw_InitForOpenGL(window, /*install_callbacks=*/false);
     ImGui_ImplOpenGL3_Init("#version 330 core");

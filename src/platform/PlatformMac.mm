@@ -106,7 +106,7 @@ private:
     NSRunningApplication *m_target_app = nil;
 
     // Hide cursor → warp to pt → post HID mouse events → warp back → show cursor.
-    // Completes in <0.5 ms so the cursor never visibly moves (CoWorkspace-CPP pattern).
+    // Completes in <0.5 ms so the cursor never visibly moves.
     static void post_mouse_event(CGPoint pt, CGMouseButton btn,
                                  CGEventType down_t, CGEventType up_t,
                                  int click_count = 1);

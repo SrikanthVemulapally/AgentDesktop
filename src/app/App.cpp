@@ -6,7 +6,7 @@
  * UI layout (left→right, top→bottom)
  * ====================================
  *   ┌─────────────────────────────────────────────────────────┐
- *   │  Title bar  (status dot · FPS · resolution · buttons)   │
+ *   │  Title bar  (app name · buttons)                        │
  *   ├───────────────────────────────┬─────────────────────────┤
  *   │  Desktop preview (GL texture) │  Sidebar                │
  *   │  Aspect-fit, click/scroll fwd │  LAUNCH / TEXT / KEYS / │
@@ -49,6 +49,8 @@
 #    define NOMINMAX
 #  endif
 #  include <windows.h>
+#  define GLFW_EXPOSE_NATIVE_WIN32
+#  include <GLFW/glfw3native.h>
 #endif
 
 #include <algorithm>
@@ -199,7 +201,7 @@ void AgentDesktopApp::upload_frame() {
 
     // Both GDI (GetDIBits/BI_RGB) and CGBitmapContext (kCGImageAlphaNoneSkipFirst)
     // return BGRA with alpha=0. Swap B↔R and force alpha=255 so the texture
-    // is opaque RGBA — matching CoWorkspace-V2's capture() approach.
+    // is opaque RGBA.
     uint8_t* p = m_latest_frame.pixels.data();
     const size_t n = m_latest_frame.pixels.size();
     for (size_t i = 0; i < n; i += 4) {
@@ -285,7 +287,8 @@ void AgentDesktopApp::render() {
     constexpr float LOG_H     = 160.f;
     constexpr float SIDEBAR_W = 270.f;
 
-    const float preview_h = total_h - TITLE_H - STATUS_H - LOG_H;
+    const float log_h     = m_show_log ? LOG_H : 0.f;
+    const float preview_h = total_h - TITLE_H - STATUS_H - log_h;
     const float sidebar_w = m_show_sidebar ? SIDEBAR_W : 0.f;
     const float preview_w = total_w - sidebar_w;
 
@@ -300,9 +303,11 @@ void AgentDesktopApp::render() {
     }
 
     // Log + status
-    ImGui::SetCursorPos({0, TITLE_H + preview_h});
-    draw_log(total_w, LOG_H);
-    ImGui::SetCursorPos({0, TITLE_H + preview_h + LOG_H});
+    if (m_show_log) {
+        ImGui::SetCursorPos({0, TITLE_H + preview_h});
+        draw_log(total_w, LOG_H);
+    }
+    ImGui::SetCursorPos({0, TITLE_H + preview_h + log_h});
     draw_statusbar(total_w, STATUS_H);
 
     ImGui::End();
@@ -324,68 +329,209 @@ void AgentDesktopApp::draw_titlebar() {
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const ImVec2 wp = ImGui::GetWindowPos();
     const float  ww = ImGui::GetWindowWidth();
+    const float  H  = 44.f;
 
     // Bottom border line
-    dl->AddLine({wp.x, wp.y+43}, {wp.x+ww, wp.y+43}, col(BORDER));
+    dl->AddLine({wp.x, wp.y + H - 1.f}, {wp.x + ww, wp.y + H - 1.f}, col(BORDER));
 
-    // Status dot (pulsing when active)
-    const float dot_x = wp.x + 18.f;
-    const float dot_y = wp.y + 22.f;
-    if (m_active) {
-        const float pulse = 0.7f + 0.3f * sinf(static_cast<float>(now()) * 3.f);
-        dl->AddCircleFilled({dot_x, dot_y}, 6.f, IM_COL32(61, 219, 130,
-            static_cast<int>(255 * pulse)));
-        dl->AddCircle({dot_x, dot_y}, 7.f, col(0x3DDB8260), 16, 1.5f);
-    } else {
-        dl->AddCircleFilled({dot_x, dot_y}, 5.f, col(0x444870FF));
+#ifdef _WIN32
+    constexpr float CTL_W  = 44.f;
+    const float     close_x = ww - CTL_W;
+    const float     max_x   = ww - CTL_W * 2.f;
+    const float     min_x   = ww - CTL_W * 3.f;
+
+    // Drag to move window (left of the system buttons)
+    {
+        ImVec2 dmin{wp.x, wp.y}, dmax{wp.x + min_x, wp.y + H};
+        if (ImGui::IsMouseHoveringRect(dmin, dmax) && ImGui::IsMouseClicked(0)) {
+            HWND hwnd = glfwGetWin32Window(m_win);
+            ReleaseCapture();
+            SendMessageW(hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0);
+            ImGui::GetIO().MouseClicked[0] = false;
+        }
+        if (ImGui::IsMouseHoveringRect(dmin, dmax) && ImGui::IsMouseDoubleClicked(0)) {
+            HWND hwnd = glfwGetWin32Window(m_win);
+            ShowWindow(hwnd, IsZoomed(hwnd) ? SW_RESTORE : SW_MAXIMIZE);
+        }
     }
 
+    // Minimize
+    {
+        ImVec2 bmin{wp.x + min_x, wp.y}, bmax{wp.x + min_x + CTL_W, wp.y + H};
+        bool hov = ImGui::IsMouseHoveringRect(bmin, bmax);
+        if (hov) dl->AddRectFilled(bmin, bmax, IM_COL32(255, 255, 255, 22));
+        float cx = bmin.x + CTL_W * .5f, cy = wp.y + H * .5f;
+        ImU32 lc = hov ? IM_COL32(255,255,255,255) : IM_COL32(255,255,255,180);
+        dl->AddLine({cx - 5.f, cy + 1.f}, {cx + 5.f, cy + 1.f}, lc, 1.5f);
+        if (hov && ImGui::IsMouseClicked(0)) {
+            ShowWindow(glfwGetWin32Window(m_win), SW_MINIMIZE);
+            ImGui::GetIO().MouseClicked[0] = false;
+        }
+    }
+
+    // Maximize / Restore
+    {
+        ImVec2 bmin{wp.x + max_x, wp.y}, bmax{wp.x + max_x + CTL_W, wp.y + H};
+        bool hov = ImGui::IsMouseHoveringRect(bmin, bmax);
+        if (hov) dl->AddRectFilled(bmin, bmax, IM_COL32(255, 255, 255, 22));
+        float cx = bmin.x + CTL_W * .5f, cy = wp.y + H * .5f;
+        ImU32 lc = hov ? IM_COL32(255,255,255,255) : IM_COL32(255,255,255,180);
+        bool maximized = !!IsZoomed(glfwGetWin32Window(m_win));
+        if (maximized) {
+            ImU32 bg = IM_COL32(10, 11, 18, 255);
+            dl->AddRect      ({cx-5.f,cy-3.f},{cx+3.f,cy+5.f}, lc, 0,0,1.2f);
+            dl->AddRectFilled({cx-3.f,cy-5.f},{cx+5.f,cy+3.f}, bg);
+            dl->AddRect      ({cx-3.f,cy-5.f},{cx+5.f,cy+3.f}, lc, 0,0,1.2f);
+        } else {
+            dl->AddRect({cx-5.f,cy-5.f},{cx+5.f,cy+5.f}, lc, 0,0,1.2f);
+        }
+        if (hov && ImGui::IsMouseClicked(0)) {
+            ShowWindow(glfwGetWin32Window(m_win), maximized ? SW_RESTORE : SW_MAXIMIZE);
+            ImGui::GetIO().MouseClicked[0] = false;
+        }
+    }
+
+    // Close
+    {
+        ImVec2 bmin{wp.x + close_x, wp.y}, bmax{wp.x + close_x + CTL_W, wp.y + H};
+        bool hov = ImGui::IsMouseHoveringRect(bmin, bmax);
+        if (hov) dl->AddRectFilled(bmin, bmax, IM_COL32(217, 48, 37, 230));
+        float cx = bmin.x + CTL_W * .5f, cy = wp.y + H * .5f;
+        ImU32 xc = hov ? IM_COL32(255,255,255,255) : IM_COL32(255,255,255,180);
+        dl->AddLine({cx-5.f,cy-5.f},{cx+5.f,cy+5.f}, xc, 1.5f);
+        dl->AddLine({cx+5.f,cy-5.f},{cx-5.f,cy+5.f}, xc, 1.5f);
+        if (hov && ImGui::IsMouseClicked(0)) {
+            glfwSetWindowShouldClose(m_win, GLFW_TRUE);
+            ImGui::GetIO().MouseClicked[0] = false;
+        }
+    }
+
+    // Content starts left-aligned; buttons end before system controls
+    const float content_x  = 18.f;
+    const float btn_limit  = min_x;   // buttons must end before here
+
+#elif defined(__APPLE__)
+    // macOS traffic lights: Close / Minimise / Maximise
+    static const struct { float x; ImU32 base; ImU32 sym; } kLights[] = {
+        {18.f, IM_COL32(255,  95,  87, 255), IM_COL32(150, 40, 35, 255)},
+        {38.f, IM_COL32(255, 189,  46, 255), IM_COL32(160,110,  0, 255)},
+        {58.f, IM_COL32( 40, 200,  64, 255), IM_COL32( 15,120, 30, 255)},
+    };
+    {
+        static const double s_launch = glfwGetTime();
+        const bool armed = (glfwGetTime() - s_launch) > 0.6;
+        bool any_hov = ImGui::IsMouseHoveringRect({wp.x, wp.y}, {wp.x+76.f, wp.y+H}, false);
+        for (int i = 0; i < 3; ++i) {
+            float cx = wp.x + kLights[i].x, cy = wp.y + H * .5f;
+            bool  hov = ImGui::IsMouseHoveringRect({cx-7,cy-7},{cx+7,cy+7}, false);
+            dl->AddCircleFilled({cx, cy}, 6.f, kLights[i].base, 20);
+            if (any_hov) {
+                ImU32 sc = kLights[i].sym;
+                if (i == 0) {
+                    dl->AddLine({cx-3,cy-3},{cx+3,cy+3}, sc, 1.3f);
+                    dl->AddLine({cx+3,cy-3},{cx-3,cy+3}, sc, 1.3f);
+                } else if (i == 1) {
+                    dl->AddLine({cx-3,cy},{cx+3,cy}, sc, 1.5f);
+                } else {
+                    dl->AddLine({cx-3,cy+1},{cx,cy-2}, sc, 1.3f);
+                    dl->AddLine({cx,cy-2},{cx+3,cy+1}, sc, 1.3f);
+                }
+            }
+            if (armed && hov && ImGui::IsMouseClicked(0)) {
+                if      (i == 0) glfwSetWindowShouldClose(m_win, GLFW_TRUE);
+                else if (i == 1) glfwIconifyWindow(m_win);
+                else             glfwMaximizeWindow(m_win);
+                ImGui::GetIO().MouseClicked[0] = false;
+            }
+        }
+    }
+
+    // Drag region (between traffic lights and buttons)
+    {
+        static bool   s_drag    = false;
+        static double s_start_cx = 0, s_start_cy = 0;
+        static int    s_start_wx = 0, s_start_wy = 0;
+
+        ImVec2 dmin{wp.x + 76.f, wp.y}, dmax{wp.x + ww - 220.f, wp.y + H};
+        if (!s_drag && ImGui::IsMouseHoveringRect(dmin, dmax) && ImGui::IsMouseClicked(0)) {
+            s_drag = true;
+            glfwGetCursorPos(m_win, &s_start_cx, &s_start_cy);
+            glfwGetWindowPos(m_win, &s_start_wx, &s_start_wy);
+            ImGui::GetIO().MouseClicked[0] = false;
+        }
+        if (s_drag) {
+            if (ImGui::IsMouseDown(0)) {
+                double cx, cy; glfwGetCursorPos(m_win, &cx, &cy);
+                int    wx, wy; glfwGetWindowPos(m_win, &wx, &wy);
+                glfwSetWindowPos(m_win,
+                    s_start_wx + int(wx + cx - s_start_wx - s_start_cx),
+                    s_start_wy + int(wy + cy - s_start_wy - s_start_cy));
+            } else {
+                s_drag = false;
+            }
+        }
+    }
+
+    const float content_x = 82.f;   // after traffic lights
+    const float btn_limit  = ww;
+
+#else
+    const float content_x = 18.f;
+    const float btn_limit  = ww;
+#endif
+
     // App title
-    ImGui::SetCursorPos({32, 12});
+    ImGui::SetCursorPos({content_x, 12.f});
     ImGui::PushStyleColor(ImGuiCol_Text, hx(TXT_HI));
     ImGui::Text("AgentDesktop");
     ImGui::PopStyleColor();
 
-    // Right-side info
-    ImGui::SameLine(0, 12);
-    if (m_active && m_platform) {
-        char info[64];
-        snprintf(info, sizeof(info), "%.0f fps  %d×%d",
-                 m_fps,
-                 m_platform->phys_width(),
-                 m_platform->phys_height());
-        ImGui::PushStyleColor(ImGuiCol_Text, hx(BLUE_DIM));
-        ImGui::Text("%s", info);
-        ImGui::PopStyleColor();
+    // Buttons — positioned relative to btn_limit (right boundary)
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
+    const float btn_y = 8.f, btn_h = 28.f;
+    // icon button (28) + gap (4) + three text buttons (54×3) + two inner gaps (4×2)
+    const float btn_block_w = 28.f + 4.f + 54.f * 3 + 4.f * 2;
+    ImGui::SetCursorPos({btn_limit - 12.f - btn_block_w, btn_y});
+
+    // Log toggle — iconic button (3-line console icon)
+    {
+        const ImVec2 log_p = ImGui::GetCursorScreenPos();
+        ImGui::InvisibleButton("##log_btn", {btn_h, btn_h});
+        if (ImGui::IsItemClicked()) m_show_log = !m_show_log;
+        const bool log_hov = ImGui::IsItemHovered();
+        ImU32 log_bg = m_show_log ? col(0x2A3060FF) : (log_hov ? col(0x2E3356FF) : col(BG3));
+        dl->AddRectFilled(log_p, {log_p.x + btn_h, log_p.y + btn_h}, log_bg, 4.f);
+        const ImU32 log_lc = (m_show_log || log_hov) ? IM_COL32(255,255,255,255)
+                                                       : IM_COL32(255,255,255,180);
+        const float lx0 = log_p.x + 6.f, lx1 = log_p.x + btn_h - 6.f;
+        const float ly0 = log_p.y + 8.f;
+        dl->AddLine({lx0, ly0},        {lx1, ly0},        log_lc, 1.5f);
+        dl->AddLine({lx0, ly0 + 5.f},  {lx1, ly0 + 5.f},  log_lc, 1.5f);
+        dl->AddLine({lx0, ly0 + 10.f}, {lx1, ly0 + 10.f}, log_lc, 1.5f);
+        if (log_hov) ImGui::SetTooltip("Toggle log panel");
     }
 
-    // Buttons on the right
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4.f);
-    const float btn_y  = 8.f;
-    const float btn_h  = 28.f;
-
-    // Help button
-    ImGui::SetCursorPos({ww - 280, btn_y});
+    ImGui::SameLine(0, 4);
     ImGui::PushStyleColor(ImGuiCol_Button,        hx(BG3));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, hx(0x2E3356FF));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive,  hx(BG3));
-    if (ImGui::Button("Help", {54, btn_h}))  m_show_help  = true;
+    if (ImGui::Button("Help", {54, btn_h})) m_show_help = true;
     ImGui::PopStyleColor(3);
 
     ImGui::SameLine(0, 4);
+    ImGui::PushStyleColor(ImGuiCol_Button,        hx(BG3));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, hx(0x2E3356FF));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive,  hx(BG3));
     if (ImGui::Button("About", {54, btn_h})) m_show_about = true;
-    ImGui::SameLine(0, 4);
+    ImGui::PopStyleColor(3);
 
-    // Sidebar toggle button
-    ImGui::PushStyleColor(ImGuiCol_Button,
-        m_show_sidebar ? hx(0x2A3060FF) : hx(BG3));
+    ImGui::SameLine(0, 4);
+    ImGui::PushStyleColor(ImGuiCol_Button,        m_show_sidebar ? hx(0x2A3060FF) : hx(BG3));
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, hx(0x2E3356FF));
     ImGui::PushStyleColor(ImGuiCol_ButtonActive,  hx(BG3));
     if (ImGui::Button("Panel", {54, btn_h})) m_show_sidebar = !m_show_sidebar;
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Toggle side panel  (Cmd+\\)");
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Toggle side panel  (Ctrl+\\)");
     ImGui::PopStyleColor(3);
-    ImGui::SameLine(0, 12);
 
     ImGui::PopStyleVar(); // FrameRounding
 
@@ -431,15 +577,6 @@ void AgentDesktopApp::draw_preview(float w, float h) {
                     IM_COL32(0,0,0,120), 0.f, 0, 1.f);
         dl->AddImage((ImTextureID)(uintptr_t)m_tex, tl, br);
 
-        // FPS overlay (top-right corner of image)
-        char buf[32];
-        snprintf(buf, sizeof(buf), "%.0f fps", m_fps);
-        const ImVec2 ts2 = ImGui::CalcTextSize(buf);
-        dl->AddRectFilled({br.x - ts2.x - 12, tl.y + 4},
-                          {br.x - 4,          tl.y + 4 + ts2.y + 4},
-                          col(0x0A0B14CC), 3.f);
-        dl->AddText({br.x - ts2.x - 8, tl.y + 6}, col(BLUE_DIM), buf);
-
         // Invisible button to capture mouse events over the image
         ImGui::SetCursorScreenPos(tl);
         ImGui::InvisibleButton("##preview_btn", {iw, ih});
@@ -460,12 +597,16 @@ void AgentDesktopApp::draw_preview(float w, float h) {
             if (sgl)   send_click(rx, ry, 0);
             if (right) send_click(rx, ry, 2);
 
-            // Crosshair cursor hint
+            // Crosshair cursor — dark outline first, bright line on top
+            // so it's visible on both light and dark backgrounds.
             ImGui::SetMouseCursor(ImGuiMouseCursor_None);
             const float cx = mp.x, cy = mp.y;
-            dl->AddLine({cx - 10, cy}, {cx + 10, cy}, col(0xFFFFFF60), 1.f);
-            dl->AddLine({cx, cy - 10}, {cx, cy + 10}, col(0xFFFFFF60), 1.f);
-            dl->AddCircle({cx, cy}, 4.f, col(0xFFFFFF90), 12, 1.f);
+            dl->AddLine({cx - 11, cy}, {cx + 11, cy}, IM_COL32(0, 0, 0, 180), 3.f);
+            dl->AddLine({cx, cy - 11}, {cx, cy + 11}, IM_COL32(0, 0, 0, 180), 3.f);
+            dl->AddCircle({cx, cy}, 5.f, IM_COL32(0, 0, 0, 180), 16, 3.f);
+            dl->AddLine({cx - 11, cy}, {cx + 11, cy}, IM_COL32(255, 255, 255, 230), 1.f);
+            dl->AddLine({cx, cy - 11}, {cx, cy + 11}, IM_COL32(255, 255, 255, 230), 1.f);
+            dl->AddCircle({cx, cy}, 5.f, IM_COL32(255, 255, 255, 210), 16, 1.f);
         }
     }
 
@@ -838,8 +979,6 @@ void AgentDesktopApp::draw_help() {
 // ---------------------------------------------------------------------------
 
 void AgentDesktopApp::on_key(int glfw_key, int action, int mods) {
-    ImGui_ImplGlfw_KeyCallback(m_win, glfw_key, 0, action, mods);
-
     // Cmd+\ (macOS) or Ctrl+\ (Win/Linux) — toggle sidebar, works always
     // GLFW_KEY_BACKSLASH=92, GLFW_MOD_SUPER=8, GLFW_MOD_CONTROL=2
     if (action != 0 /* not RELEASE */ && glfw_key == 92) {
@@ -852,7 +991,6 @@ void AgentDesktopApp::on_key(int glfw_key, int action, int mods) {
 
     if (!m_active || !m_platform) return;
     if (action == 0 /* GLFW_RELEASE */ ) return;
-    if (ImGui::GetIO().WantCaptureKeyboard) return;
 
     // Simple key-name mapping (extend as needed)
     const char* key = nullptr;
@@ -874,14 +1012,12 @@ void AgentDesktopApp::on_key(int glfw_key, int action, int mods) {
     }
     if (key) {
         const std::string k(key);
-        async([this, k]() { m_platform->key_press(k); });
+        std::thread([this, k]() { m_platform->key_press(k); }).detach();
     }
 }
 
 void AgentDesktopApp::on_char(unsigned int codepoint) {
-    ImGui_ImplGlfw_CharCallback(m_win, codepoint);
     if (!m_active || !m_platform) return;
-    if (ImGui::GetIO().WantCaptureKeyboard) return;
     // Convert single codepoint to UTF-8 and type it
     char utf8[5] = {};
     if (codepoint < 0x80u) {
@@ -896,7 +1032,7 @@ void AgentDesktopApp::on_char(unsigned int codepoint) {
     }
     if (utf8[0]) {
         const std::string s(utf8);
-        async([this, s]() { m_platform->type_text(s); });
+        std::thread([this, s]() { m_platform->type_text(s); }).detach();
     }
 }
 

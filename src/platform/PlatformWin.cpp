@@ -44,6 +44,7 @@
 #include "Platform.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -116,6 +117,10 @@ private:
     HANDLE       m_shell_proc   = nullptr; // explorer.exe on the virtual desktop
     int          m_phys_w       = 1920;
     int          m_phys_h       = 1080;
+    // Top-level window last focused by click()/double_click().
+    // type_text() and key_press() use this instead of topmost_window() so
+    // shell/taskbar windows created by Explorer cannot steal keystrokes.
+    std::atomic<uintptr_t> m_last_clicked{0};
 
     void cleanup();
     bool launch_shell();  // start explorer.exe on m_desktop
@@ -139,8 +144,6 @@ private:
     // Bring a window into focus on the virtual desktop
     void activate_window(HWND hWnd) const;
 
-    // Detect and fix solid-black Chrome windows caused by GPU compositor on hidden desktop
-    void maybe_relaunch_chrome_if_black();
 
     // LPARAM encoding for WM_*BUTTON* messages
     static LPARAM lp_xy(int x, int y) {
@@ -164,7 +167,6 @@ bool WindowsPlatform::init(std::string& error) {
     // Station-qualified name required by STARTUPINFOW.lpDesktop
     m_desk_full = L"WinSta0\\" + m_desk_name;
 
-    // GENERIC_ALL matches the working CoWorkspace reference implementation
     m_desktop = CreateDesktopW(
         m_desk_name.c_str(),
         nullptr, nullptr, 0,
@@ -195,7 +197,6 @@ bool WindowsPlatform::launch_shell() {
         return false;
     }
 
-    // Close both handles like CoWorkspace does — no need to keep them
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
     m_shell_proc = nullptr;
@@ -263,7 +264,6 @@ void WindowsPlatform::composite_to_dc(HDC hMem, HDC hScreenDC) const {
 
 // ---------------------------------------------------------------------------
 // capture — inline composite + scale + extract, single hScreenDC
-// Matches CoWorkspace's capture() exactly.
 // ---------------------------------------------------------------------------
 
 agentdesktop::Frame WindowsPlatform::capture() {
@@ -461,7 +461,7 @@ agentdesktop::LaunchResult WindowsPlatform::launch_app(
     std::wstring wargs = to_wide(args);
 
     // Chrome / Edge: inject --disable-gpu and a per-desktop user-data-dir so
-    // the browser renders correctly on the virtual display (CoWorkspace-V2 pattern).
+    // the browser renders correctly on the virtual display.
     const bool is_chrome = wpath.find(L"chrome.exe") != std::wstring::npos;
     const bool is_edge   = wpath.find(L"msedge.exe") != std::wstring::npos;
     if (is_chrome || is_edge) {
@@ -493,8 +493,54 @@ agentdesktop::LaunchResult WindowsPlatform::launch_app(
 
     result.ok  = true;
     result.pid = static_cast<int>(pi.dwProcessId);
+    const DWORD launched_pid = pi.dwProcessId;
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
+
+    // Wait for the app's main window to appear (up to 3 s) so that subsequent
+    // type_text / key_press calls target it directly instead of relying on
+    // topmost_window() which may pick up Explorer shell windows.
+    struct WaitCtx {
+        HDESK               desktop;
+        DWORD               pid;
+        HWND                found   = nullptr;
+        std::atomic<uintptr_t>* last_clicked;
+    };
+    WaitCtx wctx{ m_desktop, launched_pid, nullptr, &m_last_clicked };
+
+    HANDLE hWait = CreateThread(nullptr, 0, [](void* arg) -> DWORD {
+        auto* c = reinterpret_cast<WaitCtx*>(arg);
+        // Must bind this thread to the virtual desktop before any User32 call
+        SetThreadDesktop(c->desktop);
+
+        auto enumFn = [](HWND h, LPARAM lp) -> BOOL {
+            auto* ctx = reinterpret_cast<WaitCtx*>(lp);
+            if (!IsWindowVisible(h)) return TRUE;
+            if (GetWindow(h, GW_OWNER) != nullptr) return TRUE; // skip owned windows
+            wchar_t title[256]{};
+            GetWindowTextW(h, title, 256);
+            if (title[0] == L'\0') return TRUE;
+            DWORD wpid = 0;
+            GetWindowThreadProcessId(h, &wpid);
+            if (wpid == ctx->pid) { ctx->found = h; return FALSE; }
+            return TRUE;
+        };
+
+        for (int i = 0; i < 10 && !c->found; ++i) {
+            Sleep(300);
+            EnumDesktopWindows(c->desktop, enumFn, reinterpret_cast<LPARAM>(c));
+        }
+
+        if (c->found)
+            c->last_clicked->store(reinterpret_cast<uintptr_t>(c->found));
+        return 0;
+    }, &wctx, 0, nullptr);
+
+    if (hWait) {
+        WaitForSingleObject(hWait, 4000);
+        CloseHandle(hWait);
+    }
+
     return result;
 }
 
@@ -505,7 +551,7 @@ agentdesktop::LaunchResult WindowsPlatform::launch_app(
 agentdesktop::ActionResult WindowsPlatform::maximize_window(int pid) {
     // EnumDesktopWindows only works from a thread bound to the target desktop.
     // Spawn a fresh thread (no message queue yet), bind it to m_desktop first,
-    // then enumerate — exact same pattern as the CoWorkspace reference impl.
+    // then enumerate.
     struct Ctx {
         HDESK desktop;
         DWORD pid;
@@ -538,7 +584,7 @@ agentdesktop::ActionResult WindowsPlatform::maximize_window(int pid) {
             return TRUE;
         };
 
-        // Poll up to 5 retries × 500 ms = 2.5 s (same cadence as CoWorkspace)
+        // Poll up to 5 retries × 500 ms = 2.5 s
         EnumDesktopWindows(c->desktop, fn, reinterpret_cast<LPARAM>(c));
         for (int i = 0; i < 5 && !c->found; ++i) {
             Sleep(500);
@@ -626,7 +672,7 @@ HWND WindowsPlatform::topmost_window() const {
 // ---------------------------------------------------------------------------
 // find_typing_target — resolve the focused child input control
 // Uses AttachThreadInput to query focus across thread boundaries, then falls
-// back to searching for an Edit/RichEdit child (CoWorkspace-V2 pattern).
+// back to searching for an Edit/RichEdit child.
 // ---------------------------------------------------------------------------
 
 HWND WindowsPlatform::find_typing_target(HWND main_wnd) const {
@@ -684,86 +730,29 @@ void WindowsPlatform::activate_window(HWND hWnd) const {
     if (switched) SetThreadDesktop(hOrig);
 }
 
-// ---------------------------------------------------------------------------
-// maybe_relaunch_chrome_if_black
-// Called as a detached thread after double_click.  Waits for Chrome to start,
-// then checks if its window is solid black (GPU compositor can't render on a
-// hidden virtual desktop).  If black, kills the process and relaunches with
-// --disable-gpu so Skia falls back to software rendering GDI can capture.
-// ---------------------------------------------------------------------------
-
-void WindowsPlatform::maybe_relaunch_chrome_if_black() {
-    Sleep(3500); // give Chrome time to fully start
-
-    struct Ctx { HDESK desktop; std::vector<HWND> wnds; };
-    Ctx ctx{ m_desktop, {} };
-    EnumDesktopWindows(m_desktop, [](HWND h, LPARAM lp) -> BOOL {
-        auto* c = reinterpret_cast<Ctx*>(lp);
-        if (!IsWindowVisible(h)) return TRUE;
-        wchar_t cls[64]{};
-        GetClassNameW(h, cls, 64);
-        if (wcscmp(cls, L"Chrome_WidgetWin_1") != 0) return TRUE;
-        RECT r;
-        if (GetWindowRect(h, &r) && (r.right - r.left) > 300 && (r.bottom - r.top) > 300)
-            c->wnds.push_back(h);
-        return TRUE;
-    }, reinterpret_cast<LPARAM>(&ctx));
-
-    if (ctx.wnds.empty()) return;
-
-    HDC  hScreenDC  = GetDC(nullptr);
-    bool killed_any = false;
-
-    for (HWND hWnd : ctx.wnds) {
-        RECT r;
-        if (!GetWindowRect(hWnd, &r)) continue;
-        int ww = r.right - r.left, wh = r.bottom - r.top;
-
-        HDC     hDC  = CreateCompatibleDC(hScreenDC);
-        HBITMAP hBmp = CreateCompatibleBitmap(hScreenDC, ww, wh);
-        HGDIOBJ hOld = SelectObject(hDC, hBmp);
-        PrintWindow(hWnd, hDC, PW_RENDERFULLCONTENT);
-
-        // Sample centre-third grid
-        int x0 = ww / 3, x1 = 2 * ww / 3;
-        int y0 = wh / 3, y1 = 2 * wh / 3;
-        int black_count = 0, sample_count = 0;
-        for (int sx = x0; sx <= x1; sx += (x1 - x0) / 3 + 1)
-            for (int sy = y0; sy <= y1; sy += (y1 - y0) / 3 + 1) {
-                if (GetPixel(hDC, sx, sy) == RGB(0, 0, 0)) ++black_count;
-                ++sample_count;
-            }
-
-        SelectObject(hDC, hOld);
-        DeleteObject(hBmp);
-        DeleteDC(hDC);
-
-        if (sample_count == 0 || black_count != sample_count) continue;
-
-        DWORD pid = 0;
-        GetWindowThreadProcessId(hWnd, &pid);
-        if (pid) {
-            HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
-            if (hProc) { TerminateProcess(hProc, 0); CloseHandle(hProc); }
-        }
-        killed_any = true;
-    }
-
-    ReleaseDC(nullptr, hScreenDC);
-    if (killed_any) {
-        Sleep(800);
-        launch_app("chrome", "");
-    }
-}
 
 // ---------------------------------------------------------------------------
 // click / double_click / right_click
 // ---------------------------------------------------------------------------
 
+// Store root window as click target only if it is a real app window
+// (has a non-empty title that is not "Program Manager").
+// This prevents clicking on the virtual desktop background — which is a
+// shell window — from redirecting subsequent keystrokes to the shell.
+static void try_set_last_clicked(std::atomic<uintptr_t>& out, HWND tgt) {
+    HWND root = GetAncestor(tgt, GA_ROOT);
+    HWND candidate = root ? root : tgt;
+    wchar_t title[256]{};
+    GetWindowTextW(candidate, title, 256);
+    if (title[0] != L'\0' && wcscmp(title, L"Program Manager") != 0)
+        out.store(reinterpret_cast<uintptr_t>(candidate));
+}
+
 agentdesktop::ActionResult WindowsPlatform::click(int x, int y) {
     auto [tgt, cx, cy] = hit_test(x, y);
     if (!tgt) return {false, "No window at coordinate"};
     activate_window(tgt);
+    try_set_last_clicked(m_last_clicked, tgt);
     const LPARAM lp = lp_xy(cx, cy);
     PostMessage(tgt, WM_MOUSEMOVE,   0,          lp);
     PostMessage(tgt, WM_LBUTTONDOWN, MK_LBUTTON, lp);
@@ -775,15 +764,13 @@ agentdesktop::ActionResult WindowsPlatform::double_click(int x, int y) {
     auto [tgt, cx, cy] = hit_test(x, y);
     if (!tgt) return {false, "No window at coordinate"};
     activate_window(tgt);
+    try_set_last_clicked(m_last_clicked, tgt);
     const LPARAM lp = lp_xy(cx, cy);
     PostMessage(tgt, WM_MOUSEMOVE,     0,          lp);
     PostMessage(tgt, WM_LBUTTONDOWN,   MK_LBUTTON, lp);
     PostMessage(tgt, WM_LBUTTONUP,     0,          lp);
     PostMessage(tgt, WM_LBUTTONDBLCLK, MK_LBUTTON, lp);
     PostMessage(tgt, WM_LBUTTONUP,     0,          lp);
-    // Chrome launched via double-click may render black on a hidden desktop;
-    // detect and fix it in the background (CoWorkspace reference pattern).
-    std::thread([this]() { maybe_relaunch_chrome_if_black(); }).detach();
     return {true};
 }
 
@@ -815,14 +802,18 @@ agentdesktop::ActionResult WindowsPlatform::scroll(int x, int y, int delta) {
 // ---------------------------------------------------------------------------
 
 agentdesktop::ActionResult WindowsPlatform::type_text(const std::string& text) {
-    const HWND hMain = topmost_window();
-    if (!hMain) return {false, "No active window on virtual desktop"};
+    // Use the window last focused by launch_app() or click().  Never fall back
+    // to topmost_window(): it can return Explorer shell/search windows whose
+    // titles are non-empty, causing keystrokes to open cmd or a search bar.
+    HWND hMain = reinterpret_cast<HWND>(m_last_clicked.load());
+    if (!hMain || !IsWindow(hMain))
+        return {false, "No target window — launch an app or click in the preview first"};
 
     const HWND hTarget = find_typing_target(hMain);
-    activate_window(hTarget);
     const std::wstring wide = to_wide(text);
+    const HWND dst = hTarget ? hTarget : hMain;
     for (wchar_t ch : wide)
-        PostMessage(hTarget, WM_CHAR, static_cast<WPARAM>(ch), 1);
+        PostMessage(dst, WM_CHAR, static_cast<WPARAM>(ch), 1);
     return {true};
 }
 
@@ -868,7 +859,9 @@ agentdesktop::ActionResult WindowsPlatform::key_press(const std::string& key) {
 
     if (!vk) return {false, "Unrecognised key: " + key};
 
-    HWND hMain   = topmost_window();
+    HWND hMain = reinterpret_cast<HWND>(m_last_clicked.load());
+    if (!hMain || !IsWindow(hMain))
+        return {false, "No target window — launch an app or click in the preview first"};
     HWND hTarget = find_typing_target(hMain);
 
     if (ctrl || alt || shift) {
@@ -876,7 +869,7 @@ agentdesktop::ActionResult WindowsPlatform::key_press(const std::string& key) {
         // fail in apps that check GetKeyState(VK_CONTROL) in their WM_KEYDOWN handler.
         // Use SendInput instead — it feeds the hardware input queue and sets keyboard
         // state correctly. Switch to the virtual desktop thread first and bring the
-        // target window into focus (CoWorkspace-V2 pattern).
+        // target window into focus.
         DWORD tid_current = GetCurrentThreadId();
         HDESK hOrig       = GetThreadDesktop(tid_current);
         bool  switched    = (hOrig != m_desktop) && SetThreadDesktop(m_desktop);

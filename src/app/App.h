@@ -132,6 +132,7 @@ private:
     bool m_show_about    = false;
     bool m_show_help     = false;
     bool m_show_sidebar  = false;  ///< Toggle with Cmd+\ (macOS) / Ctrl+\ (Win/Linux)
+    bool m_show_log      = false;  ///< Toggle with log icon button in title bar
 
     // -----------------------------------------------------------------------
     // In-app log
