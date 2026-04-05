@@ -1,0 +1,45 @@
+# Build output
+build/
+bin/
+
+# IDE and editor files
+.vs/
+.vscode/
+*.suo
+*.user
+*.sln.docuser
+*.vcxproj.user
+.idea/
+*.swp
+*.swo
+*~
+
+# CMake generated
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# Compiled objects and binaries
+*.obj
+*.o
+*.exe
+*.dll
+*.so
+*.dylib
+*.lib
+*.a
+*.pdb
+*.ilk
+*.exp
+
+# Logs
+*.log
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Config files that may contain local settings
+agentdesktop.ini

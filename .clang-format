@@ -1,0 +1,78 @@
+---
+# AgentDesktop .clang-format
+# Based on LLVM style with project-specific overrides.
+BasedOnStyle:  LLVM
+Language:      Cpp
+Standard:      c++17
+
+# Indentation
+IndentWidth:              4
+ContinuationIndentWidth:  4
+TabWidth:                 4
+UseTab:                   Never
+AccessModifierOffset:    -4
+
+# Column limit
+ColumnLimit:             100
+
+# Braces
+BreakBeforeBraces:       Attach
+Cpp11BracedListStyle:    true
+
+# Alignment
+AlignAfterOpenBracket:   Align
+AlignConsecutiveAssignments:
+  Enabled:               true
+  AcrossEmptyLines:      false
+  AcrossComments:        false
+AlignConsecutiveDeclarations:
+  Enabled:               false
+AlignTrailingComments:
+  Kind:                  Always
+  OverEmptyLines:        0
+
+# Spacing
+SpaceBeforeParens:       ControlStatements
+SpaceInEmptyParentheses: false
+SpacesInAngles:          Never
+SpacesInParentheses:     false
+SpacesInSquareBrackets:  false
+SpaceAfterCStyleCast:    false
+
+# Includes
+SortIncludes:            CaseSensitive
+IncludeBlocks:           Regroup
+IncludeCategories:
+  # Project headers first
+  - Regex:           '^"'
+    Priority:        1
+  # System / third-party
+  - Regex:           '^<'
+    Priority:        2
+
+# Pointers & references
+PointerAlignment:        Left
+ReferenceAlignment:      Left
+
+# Function arguments / parameters
+BinPackArguments:        false
+BinPackParameters:       false
+AllowAllArgumentsOnNextLine:   true
+AllowAllParametersOfDeclarationOnNextLine: true
+
+# Short constructs
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLambdasOnASingleLine: Inline
+AllowShortLoopsOnASingleLine:   false
+
+# Line breaking
+BreakBeforeBinaryOperators:  NonAssignment
+BreakConstructorInitializers: BeforeColon
+BreakInheritanceList:         BeforeColon
+
+# Misc
+MaxEmptyLinesToKeep:     2
+KeepEmptyLinesAtTheStartOfBlocks: false
+ReflowComments:          true
+...
